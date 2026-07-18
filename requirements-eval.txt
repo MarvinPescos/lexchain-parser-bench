@@ -1,0 +1,6 @@
+# CPU-only dependencies for evaluate.py (runs on Kaggle or any laptop)
+rapidfuzz>=3.0
+apted>=1.0.3
+lxml>=4.9
+pandas>=2.0
+tabulate>=0.9
