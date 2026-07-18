@@ -208,10 +208,15 @@ class ToolRun:
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     on_kaggle = Path("/kaggle").exists()
+    ap.add_argument("--condition", choices=["digital", "scanned"], default="digital",
+                    help="'scanned' reads pdfs/law_scanned (built by make_scanned.py) "
+                         "and defaults results to results_scanned/; tool configs are "
+                         "identical across conditions")
     ap.add_argument("--data-dir", type=Path,
                     default=Path("/kaggle/tmp/ohr_data" if on_kaggle else "data"))
-    ap.add_argument("--results-dir", type=Path,
-                    default=Path("/kaggle/working/results" if on_kaggle else "results"))
+    ap.add_argument("--results-dir", type=Path, default=None,
+                    help="default: /kaggle/working/results (digital) or "
+                         "results_scanned (scanned)")
     ap.add_argument("--envs-dir", type=Path,
                     default=Path("/kaggle/tmp/envs" if on_kaggle else "envs"))
     ap.add_argument("--tools", default=",".join(TOOLS_DEFAULT))
@@ -228,11 +233,18 @@ def main():
     args = ap.parse_args()
 
     tools = [t.strip() for t in args.tools.split(",") if t.strip()]
+    if args.results_dir is None:
+        name = "results" if args.condition == "digital" else "results_scanned"
+        args.results_dir = Path(f"/kaggle/working/{name}" if on_kaggle else name)
     args.results_dir.mkdir(parents=True, exist_ok=True)
     if args.restore_from:
         restore_from(args.restore_from, args.results_dir)
 
-    pdf_dir = args.data_dir / "pdfs" / "law"
+    subdir = "law" if args.condition == "digital" else "law_scanned"
+    pdf_dir = args.data_dir / "pdfs" / subdir
+    if args.condition == "scanned" and not any(pdf_dir.glob("*.pdf")):
+        raise SystemExit(f"No PDFs in {pdf_dir} -- run make_scanned.py first")
+    log(f"condition: {args.condition} (pdfs: {pdf_dir}, results: {args.results_dir})")
     pdfs = sorted(pdf_dir.glob("*.pdf"), key=lambda p: p.stat().st_size)
     if args.docs:
         wanted = {d.strip() for d in args.docs.split(",")}

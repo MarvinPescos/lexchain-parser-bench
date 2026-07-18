@@ -15,6 +15,15 @@ Benchmark of three PDF document-parsing tools — **[Docling](https://github.com
 
 Note: OHR-Bench's released eval code covers the RAG stages (retrieval/generation) only; its OCR-quality edit distance is reimplemented here, and table/reading-order metrics follow OmniDocBench (same lab). State this in the paper's methodology.
 
+## Conditions
+
+The Law set is 88 digital-born / 7 natively-scanned PDFs (a doc counts as scanned when >50% of its pages have <50 extractable chars, via pymupdf). Because LexChain's real workload is mostly scanned, the benchmark has two run conditions and three reporting slices:
+
+- **digital** (default) — original PDFs, `results/`
+- **scanned** — `make_scanned.py` rasterizes every PDF at 200 DPI into an image-only copy (`pdfs/law_scanned/`, same filenames → GT maps 1:1, verified to contain no text layer); `run_benchmark.py --condition scanned` writes to `results_scanned/`. Tool configs are identical — the input is the only variable.
+
+`evaluate.py --detect-scanned` writes `digital_docs.txt`/`scanned_docs.txt`; `evaluate.py --filter-docs <file> --out-prefix <name>` scores a slice. `compare_conditions.py` emits the combined paper table (`comparison.csv`/`comparison.md`) — digital-born (88) / natively-scanned (7) / simulated-scanned (95) per tool — plus a ranking-stability note (flags if the tool ordering by NED/TEDS/s-per-page changes across conditions).
+
 ## Why three venvs
 
 `mineru` requires `pillow>=11.0.0` while `marker-pdf` requires `Pillow<11.0.0` (hard conflict, verified on PyPI 2026-07), with further divergent `torch`/`transformers`/`surya-ocr` pins. `setup.sh` creates one `uv` venv per tool; a shared wheel cache hardlinks the common heavy wheels.
@@ -46,10 +55,14 @@ python tests/run_tests.py        # metric unit tests + fake-parser e2e (resume, 
 
 ```
 setup.sh                 Kaggle setup: 3 uv venvs, OHR-Bench Law data, model prefetch
-run_benchmark.py         orchestrator (stdlib-only): scheduling, checkpoints, watchdog
+run_benchmark.py         orchestrator (stdlib-only): scheduling, checkpoints, watchdog,
+                         --condition {digital,scanned}
 workers/parse_worker.py  per-tool adapter, runs inside the tool's venv
-evaluate.py              metrics -> CSV + markdown table
+make_scanned.py          build the simulated-scanned (image-only) PDF set
+evaluate.py              metrics -> CSV + markdown table; --filter-docs, --detect-scanned
+compare_conditions.py    combined 3-slice paper table + ranking-stability check
+estimate_runtime.py      project full-run wall time from smoke-test metas
 teds.py                  TEDS (adapted from IBM PubTabNet, Apache-2.0)
-benchmark.ipynb          Kaggle driver notebook
+benchmark.ipynb          Kaggle driver notebook (Part 1 digital, Part 2 scanned)
 tests/run_tests.py       local tests (no GPU needed)
 ```

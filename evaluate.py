@@ -289,7 +289,8 @@ def evaluate_doc(gt_pages: list[str], pred_pages: list[str], paginated: bool):
     }
 
 
-def evaluate_tool(tool: str, results_dir: Path, gt: dict[str, list[str]]):
+def evaluate_tool(tool: str, results_dir: Path, gt: dict[str, list[str]],
+                  doc_filter: set[str] | None = None):
     tool_dir = results_dir / tool
     meta_dir = tool_dir / "meta"
     rows = []
@@ -298,6 +299,8 @@ def evaluate_tool(tool: str, results_dir: Path, gt: dict[str, list[str]]):
         return rows, all_teds, all_teds_s
     for meta_path in sorted(meta_dir.glob("*.json")):
         stem = meta_path.stem
+        if doc_filter is not None and stem not in doc_filter:
+            continue
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         gt_pages = gt.get(stem)
         row = {
@@ -343,6 +346,62 @@ def summarize(tool: str, rows: list[dict], all_teds, all_teds_s):
     }
 
 
+def evaluate_slice(tools, results_dir: Path, gt: dict[str, list[str]],
+                   doc_filter: set[str] | None = None, quiet: bool = False):
+    """Evaluate one slice of results. Returns (per_doc_rows, summaries)."""
+    per_doc, summaries = [], []
+    for tool in tools:
+        rows, all_teds, all_teds_s = evaluate_tool(tool, results_dir, gt, doc_filter)
+        if not rows:
+            if not quiet:
+                print(f"[{tool}] no results found, skipping")
+            continue
+        per_doc += rows
+        s = summarize(tool, rows, all_teds, all_teds_s)
+        summaries.append(s)
+        if not quiet:
+            print(
+                f"[{tool}] {s['docs']} docs, success {s['success_rate']:.0%}, "
+                f"NED {s['ned']:.4f}" if s["ned"] is not None
+                else f"[{tool}] {s['docs']} docs, no scored docs"
+            )
+    return per_doc, summaries
+
+
+# ------------------------------------------------- scanned-vs-digital slicing
+
+SCAN_MIN_CHARS = 50     # a page with fewer extractable chars counts as image-only
+SCAN_PAGE_FRAC = 0.5    # doc is "scanned" if MORE than this fraction of pages are
+
+
+def is_scanned_pdf(pdf_path: Path) -> bool:
+    """A doc is natively scanned if >50% of its pages have <50 extractable chars."""
+    import fitz  # pymupdf, only needed for --detect-scanned
+
+    with fitz.open(pdf_path) as doc:
+        if len(doc) == 0:
+            return False
+        low_text = sum(1 for page in doc if len(page.get_text().strip()) < SCAN_MIN_CHARS)
+        return low_text / len(doc) > SCAN_PAGE_FRAC
+
+
+def detect_scanned(pdf_dir: Path, out_dir: Path):
+    """Classify every original PDF; write digital_docs.txt / scanned_docs.txt."""
+    digital, scanned = [], []
+    for pdf in sorted(pdf_dir.glob("*.pdf")):
+        (scanned if is_scanned_pdf(pdf) else digital).append(pdf.stem)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "digital_docs.txt").write_text("\n".join(digital) + "\n")
+    (out_dir / "scanned_docs.txt").write_text("\n".join(scanned) + "\n")
+    print(f"detect-scanned: {len(digital)} digital-born, {len(scanned)} natively scanned "
+          f"-> {out_dir}/digital_docs.txt, scanned_docs.txt")
+    return digital, scanned
+
+
+def load_doc_filter(path: Path) -> set[str]:
+    return {line.strip() for line in path.read_text().splitlines() if line.strip()}
+
+
 PAPER_COLS = [
     ("tool", "Tool"),
     ("ned", "NED ↓"),
@@ -360,6 +419,13 @@ def main():
     ap.add_argument("--data-dir", type=Path, default=None)
     ap.add_argument("--results-dir", type=Path, default=None)
     ap.add_argument("--tools", default=",".join(TOOLS_DEFAULT))
+    ap.add_argument("--filter-docs", type=Path, default=None,
+                    help="file with doc stems (one per line); evaluate only those docs")
+    ap.add_argument("--out-prefix", default="results",
+                    help="output filename prefix, e.g. 'results_digital'")
+    ap.add_argument("--detect-scanned", action="store_true",
+                    help="classify pdfs/law into digital_docs.txt / scanned_docs.txt "
+                         "(written to the results dir) and exit")
     args = ap.parse_args()
 
     on_kaggle = Path("/kaggle").exists()
@@ -367,38 +433,34 @@ def main():
     results_dir = args.results_dir or Path("/kaggle/working/results" if on_kaggle else "results")
     tools = [t.strip() for t in args.tools.split(",") if t.strip()]
 
+    if args.detect_scanned:
+        detect_scanned(data_dir / "pdfs" / "law", results_dir)
+        return
+
     gt = load_gt(data_dir)
     if not gt:
         raise SystemExit(f"No ground truth found under {data_dir}/gt/law")
     print(f"Ground truth: {len(gt)} docs, {sum(len(p) for p in gt.values())} pages")
 
-    per_doc, summaries = [], []
-    for tool in tools:
-        rows, all_teds, all_teds_s = evaluate_tool(tool, results_dir, gt)
-        if not rows:
-            print(f"[{tool}] no results found, skipping")
-            continue
-        per_doc += rows
-        s = summarize(tool, rows, all_teds, all_teds_s)
-        summaries.append(s)
-        print(
-            f"[{tool}] {s['docs']} docs, success {s['success_rate']:.0%}, "
-            f"NED {s['ned']:.4f}" if s["ned"] is not None else f"[{tool}] no scored docs"
-        )
+    doc_filter = load_doc_filter(args.filter_docs) if args.filter_docs else None
+    if doc_filter is not None:
+        print(f"Filter: {len(doc_filter)} docs from {args.filter_docs}")
 
+    per_doc, summaries = evaluate_slice(tools, results_dir, gt, doc_filter)
     if not summaries:
         raise SystemExit("Nothing to evaluate.")
 
     results_dir.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(per_doc).to_csv(results_dir / "results_per_doc.csv", index=False)
+    prefix = args.out_prefix
+    pd.DataFrame(per_doc).to_csv(results_dir / f"{prefix}_per_doc.csv", index=False)
     summary_df = pd.DataFrame(summaries)
-    summary_df.to_csv(results_dir / "results_summary.csv", index=False)
+    summary_df.to_csv(results_dir / f"{prefix}_summary.csv", index=False)
 
     paper = summary_df[[c for c, _ in PAPER_COLS]].rename(columns=dict(PAPER_COLS))
     md_table = paper.to_markdown(index=False, floatfmt=".4f")
-    (results_dir / "results.md").write_text(md_table + "\n", encoding="utf-8")
+    (results_dir / f"{prefix}.md").write_text(md_table + "\n", encoding="utf-8")
     print("\n" + md_table)
-    print(f"\nWrote {results_dir}/results_per_doc.csv, results_summary.csv, results.md")
+    print(f"\nWrote {results_dir}/{prefix}_per_doc.csv, {prefix}_summary.csv, {prefix}.md")
     print("Note: quality metrics are computed over successful docs only; "
           "TEDS covers docs whose GT contains tables (see gt_tables_scored).")
 

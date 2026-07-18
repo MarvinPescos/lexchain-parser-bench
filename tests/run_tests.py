@@ -178,10 +178,164 @@ def test_mid_run_kill_resume():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _make_text_pdf(path: Path, n_pages=3):
+    import fitz
+
+    doc = fitz.open()
+    for i in range(n_pages):
+        page = doc.new_page()
+        page.insert_text((72, 72), f"Hello searchable text on page {i}. " * 5)
+    doc.save(path)
+    doc.close()
+
+
+def test_make_scanned():
+    print("make_scanned (rasterize + verify + resume)")
+    import fitz
+
+    tmp = Path(tempfile.mkdtemp(prefix="benchtest_"))
+    try:
+        src_dir, out_dir = tmp / "src", tmp / "out"
+        src_dir.mkdir()
+        _make_text_pdf(src_dir / "doc_a.pdf", 3)
+        _make_text_pdf(src_dir / "doc_b.pdf", 2)
+        (out_dir / "x").mkdir(parents=True)  # ensure out dir may pre-exist
+        (out_dir / "x").rmdir()
+        (out_dir / "stale.pdf.tmp").write_bytes(b"partial")  # must be cleaned up
+
+        cmd = [sys.executable, str(REPO / "make_scanned.py"),
+               "--src-dir", str(src_dir), "--out-dir", str(out_dir), "--dpi", "72"]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        check("make_scanned exit 0", r.returncode == 0, r.stderr[-500:])
+        check("tmp file cleaned", not (out_dir / "stale.pdf.tmp").exists())
+        for name, n in [("doc_a.pdf", 3), ("doc_b.pdf", 2)]:
+            with fitz.open(out_dir / name) as d:
+                check(f"{name} page count", len(d) == n)
+                check(f"{name} no text layer",
+                      all(len(p.get_text().strip()) == 0 for p in d))
+
+        mtime = (out_dir / "doc_a.pdf").stat().st_mtime_ns
+        r2 = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        check("make_scanned resume exit 0", r2.returncode == 0, r2.stderr[-500:])
+        check("resume skips existing", (out_dir / "doc_a.pdf").stat().st_mtime_ns == mtime)
+        check("resume reports skipped", "2 skipped" in r2.stdout, r2.stdout[-300:])
+
+        from evaluate import is_scanned_pdf
+        check("text pdf -> digital", not is_scanned_pdf(src_dir / "doc_a.pdf"))
+        check("rasterized pdf -> scanned", is_scanned_pdf(out_dir / "doc_a.pdf"))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_scanned_condition():
+    print("--condition scanned (fake e2e)")
+    tmp = Path(tempfile.mkdtemp(prefix="benchtest_"))
+    try:
+        for sub in ("law", "law_scanned"):
+            d = tmp / "data" / "pdfs" / sub
+            d.mkdir(parents=True)
+            (d / "doc_x.pdf").write_bytes(b"%PDF-fake " + sub.encode())
+        (tmp / "data" / "gt" / "law").mkdir(parents=True)
+
+        def run(extra):
+            return subprocess.run(
+                [sys.executable, str(REPO / "run_benchmark.py"),
+                 "--data-dir", str(tmp / "data"), "--envs-dir", str(tmp / "envs"),
+                 "--tools", "fake"] + extra,
+                capture_output=True, text=True, timeout=120, cwd=str(tmp),
+            )
+
+        r = run(["--condition", "scanned"])
+        check("scanned run exit 0", r.returncode == 0, r.stderr[-500:])
+        check("scanned results dir used",
+              (tmp / "results_scanned" / "fake" / "meta" / "doc_x.json").exists())
+        check("digital results untouched", not (tmp / "results").exists())
+
+        shutil.rmtree(tmp / "data" / "pdfs" / "law_scanned")
+        (tmp / "data" / "pdfs" / "law_scanned").mkdir()
+        r2 = run(["--condition", "scanned", "--results-dir", str(tmp / "r2")])
+        check("scanned guard errors when set missing",
+              r2.returncode != 0 and "make_scanned" in (r2.stdout + r2.stderr))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _write_fake_result(results_dir: Path, tool: str, stem: str, text: str):
+    d = results_dir / tool
+    for sub in ("meta", "pages", "markdown"):
+        (d / sub).mkdir(parents=True, exist_ok=True)
+    (d / "markdown" / f"{stem}.md").write_text(text)
+    (d / "pages" / f"{stem}.json").write_text(
+        json.dumps({"paginated": True, "pages": {"0": text}}))
+    (d / "meta" / f"{stem}.json").write_text(json.dumps(
+        {"doc": stem, "tool": tool, "status": "success", "wall_s": 1.0, "pages": 1}))
+
+
+def test_compare_conditions():
+    print("compare_conditions (3 slices + ranking flag)")
+    tmp = Path(tempfile.mkdtemp(prefix="benchtest_"))
+    try:
+        gt_dir = tmp / "data" / "gt" / "law"
+        gt_dir.mkdir(parents=True)
+        (tmp / "data" / "pdfs" / "law").mkdir(parents=True)
+        texts = {"doc_1": "Alpha bravo charlie delta echo foxtrot golf hotel india juliett.",
+                 "doc_2": "Kilo lima mike november oscar papa quebec romeo sierra tango."}
+        for stem, text in texts.items():
+            (gt_dir / f"{stem}.json").write_text(
+                json.dumps([{"page_idx": 0, "text": text}]))
+
+        res, res_sc = tmp / "results", tmp / "results_scanned"
+        for stem, text in texts.items():
+            _write_fake_result(res, "toolA", stem, text)          # digital: both perfect
+            _write_fake_result(res, "toolB", stem, text)
+            _write_fake_result(res_sc, "toolA", stem, "zz " * 10)  # scanned: A garbled
+            _write_fake_result(res_sc, "toolB", stem, text)        # scanned: B perfect
+        res.mkdir(exist_ok=True)
+        (res / "digital_docs.txt").write_text("doc_1\n")
+        (res / "scanned_docs.txt").write_text("doc_2\n")
+
+        r = subprocess.run(
+            [sys.executable, str(REPO / "compare_conditions.py"),
+             "--data-dir", str(tmp / "data"), "--results-dir", str(res),
+             "--scanned-results-dir", str(res_sc), "--tools", "toolA,toolB"],
+            capture_output=True, text=True, timeout=120,
+        )
+        check("compare exit 0", r.returncode == 0, r.stderr[-800:])
+        md = (res / "comparison.md").read_text()
+        for cond in ("digital-born", "natively-scanned", "simulated-scanned"):
+            check(f"slice present: {cond}", cond in md)
+        check("ranking difference flagged", "DIFFERS" in md, md[-600:])
+        import csv
+        with open(res / "comparison.csv") as f:
+            rows = list(csv.DictReader(f))
+        check("6 condition x tool rows", len(rows) == 6, str(len(rows)))
+        by_cond_tool = {(r["condition"], r["tool"]): r for r in rows}
+        check("digital slice filtered to n=1",
+              by_cond_tool[("digital-born", "toolA")]["docs"] == "1")
+        check("scanned toolA garbled NED high",
+              float(by_cond_tool[("simulated-scanned", "toolA")]["ned"]) > 0.5)
+
+        # evaluate.py CLI: --filter-docs + --out-prefix
+        r2 = subprocess.run(
+            [sys.executable, str(REPO / "evaluate.py"),
+             "--data-dir", str(tmp / "data"), "--results-dir", str(res),
+             "--tools", "toolA", "--filter-docs", str(res / "digital_docs.txt"),
+             "--out-prefix", "results_digital"],
+            capture_output=True, text=True, timeout=120,
+        )
+        check("evaluate --filter-docs exit 0", r2.returncode == 0, r2.stderr[-500:])
+        check("out-prefix respected", (res / "results_digital.md").exists())
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     test_text_metrics()
     test_reading_order()
     test_tables()
     test_fake_e2e()
     test_mid_run_kill_resume()
+    test_make_scanned()
+    test_scanned_condition()
+    test_compare_conditions()
     print(f"\nALL {PASS} CHECKS PASSED")
