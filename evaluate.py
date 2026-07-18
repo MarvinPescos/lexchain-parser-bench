@@ -399,7 +399,15 @@ def detect_scanned(pdf_dir: Path, out_dir: Path):
 
 
 def load_doc_filter(path: Path) -> set[str]:
-    return {line.strip() for line in path.read_text().splitlines() if line.strip()}
+    # Strip only line terminators: doc stems are PDF filename stems verbatim, and
+    # OHR-Bench Law contains one filename with a trailing space ("ADMA ... Agreement .pdf").
+    # A full strip() here desyncs the filter from the meta/GT stems and silently
+    # drops that doc from the slice.
+    return {
+        line.rstrip("\r\n")
+        for line in path.read_text().splitlines()
+        if line.rstrip("\r\n")
+    }
 
 
 PAPER_COLS = [

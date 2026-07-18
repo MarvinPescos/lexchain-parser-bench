@@ -278,8 +278,11 @@ def test_compare_conditions():
         gt_dir = tmp / "data" / "gt" / "law"
         gt_dir.mkdir(parents=True)
         (tmp / "data" / "pdfs" / "law").mkdir(parents=True)
+        # "doc_3 " has a trailing space, like OHR-Bench's "ADMA ... Agreement .pdf":
+        # its stem must survive the digital_docs.txt round-trip (regression)
         texts = {"doc_1": "Alpha bravo charlie delta echo foxtrot golf hotel india juliett.",
-                 "doc_2": "Kilo lima mike november oscar papa quebec romeo sierra tango."}
+                 "doc_2": "Kilo lima mike november oscar papa quebec romeo sierra tango.",
+                 "doc_3 ": "Uniform victor whiskey xray yankee zulu one two three four five."}
         for stem, text in texts.items():
             (gt_dir / f"{stem}.json").write_text(
                 json.dumps([{"page_idx": 0, "text": text}]))
@@ -291,8 +294,13 @@ def test_compare_conditions():
             _write_fake_result(res_sc, "toolA", stem, "zz " * 10)  # scanned: A garbled
             _write_fake_result(res_sc, "toolB", stem, text)        # scanned: B perfect
         res.mkdir(exist_ok=True)
-        (res / "digital_docs.txt").write_text("doc_1\n")
+        (res / "digital_docs.txt").write_text("doc_1\ndoc_3 \n")
         (res / "scanned_docs.txt").write_text("doc_2\n")
+
+        from evaluate import load_doc_filter
+        flt = load_doc_filter(res / "digital_docs.txt")
+        check("filter keeps trailing-space stem", "doc_3 " in flt, str(flt))
+        check("filter strips newlines only", flt == {"doc_1", "doc_3 "}, str(flt))
 
         r = subprocess.run(
             [sys.executable, str(REPO / "compare_conditions.py"),
@@ -310,8 +318,9 @@ def test_compare_conditions():
             rows = list(csv.DictReader(f))
         check("6 condition x tool rows", len(rows) == 6, str(len(rows)))
         by_cond_tool = {(r["condition"], r["tool"]): r for r in rows}
-        check("digital slice filtered to n=1",
-              by_cond_tool[("digital-born", "toolA")]["docs"] == "1")
+        check("digital slice includes trailing-space doc (n=2)",
+              by_cond_tool[("digital-born", "toolA")]["docs"] == "2",
+              str(by_cond_tool[("digital-born", "toolA")]))
         check("scanned toolA garbled NED high",
               float(by_cond_tool[("simulated-scanned", "toolA")]["ned"]) > 0.5)
 
